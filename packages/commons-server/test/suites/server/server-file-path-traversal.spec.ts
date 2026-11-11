@@ -2,14 +2,21 @@ import { BodyTypes, Environment, ServerErrorCodes } from '@mockoon/commons';
 import { expect } from 'chai';
 import { promises as fs } from 'fs';
 import { get as httpGet } from 'http';
-import { resolve as pathResolve } from 'path';
+import {
+  parse as pathParse,
+  relative as pathRelative,
+  resolve as pathResolve
+} from 'path';
 import { MockoonServer } from '../../../src';
 
 const port = 3020;
+const rootPort = 3021;
 const relativePathError =
-  'Access to relative path outside of the environment base directory';
+  'Access to relative path outside of the allowed base directory';
 const absolutePathError =
   'Access to absolute path outside of the original static base directory';
+const nonRootBaseError =
+  'Templated file path requires a non-root base directory';
 // content of the package.json file located outside of the served directories
 const packageNameField = '"name": "@mockoon/commons-server"';
 
@@ -51,9 +58,12 @@ function getSafeFilePathError(
   return '';
 }
 
-function getBody(path: string): Promise<{ status?: number; body: string }> {
+function getBody(
+  path: string,
+  serverPort = port
+): Promise<{ status?: number; body: string }> {
   return new Promise((resolve, reject) => {
-    const url = `http://localhost:${port}${path}`;
+    const url = `http://localhost:${serverPort}${path}`;
     const clientRequest = httpGet(url, (response) => {
       let body = '';
 
@@ -73,6 +83,9 @@ function getBody(path: string): Promise<{ status?: number; body: string }> {
 describe('Server file path traversal protection', () => {
   const dataDirectory = pathResolve('./test/data');
   const publicDirectory = pathResolve('./test/data/public');
+  const fileSystemRoot = pathParse(dataDirectory).root;
+  const packageJsonPath = pathResolve(dataDirectory, '../../package.json');
+  const packageJsonFromRoot = pathRelative(fileSystemRoot, packageJsonPath);
   let environment: Environment;
   let server: MockoonServer;
 
@@ -222,7 +235,7 @@ describe('Server file path traversal protection', () => {
       const request = buildRequest({ filename: absolutePath });
       const errorMessage = getSafeFilePathError(server, filePath, request);
 
-      expect(errorMessage).to.contain(absolutePathError);
+      expect(errorMessage).to.contain(nonRootBaseError);
     });
 
     it('should allow an absolute partially templated file path', () => {
@@ -239,6 +252,83 @@ describe('Server file path traversal protection', () => {
       const errorMessage = getSafeFilePathError(server, filePath, request);
 
       expect(errorMessage).to.contain(absolutePathError);
+    });
+  });
+
+  describe('Templated file path safety', () => {
+    let rootServer: MockoonServer;
+
+    before(() => {
+      rootServer = new MockoonServer(environment, {
+        environmentDirectory: fileSystemRoot
+      });
+    });
+
+    it('should block absolute templated paths escaping to a sibling directory with a shared prefix', () => {
+      const filePath = `${publicDirectory}/{{queryParam 'name'}}`;
+      const request = buildRequest({ name: '../public_backup/secret.txt' });
+      const errorMessage = getSafeFilePathError(server, filePath, request);
+
+      expect(errorMessage).to.contain(absolutePathError);
+    });
+
+    it('should block relative templated paths from escaping a nested static base when the environment directory is root', () => {
+      const filePath = "./static/{{queryParam 'name'}}";
+      const request = buildRequest({ name: '../static_secret.txt' });
+      const errorMessage = getSafeFilePathError(rootServer, filePath, request);
+
+      expect(errorMessage).to.contain(relativePathError);
+    });
+
+    it('should block relative templated paths from escaping a nested static base inside the environment directory', () => {
+      const filePath = "./static/{{queryParam 'name'}}";
+      const request = buildRequest({ name: '../plain.data' });
+      const errorMessage = getSafeFilePathError(server, filePath, request);
+
+      expect(errorMessage).to.contain(relativePathError);
+    });
+
+    it('should reject templated file paths when the only allowed base directory is the filesystem root', () => {
+      const filePath = "./{{queryParam 'name'}}";
+      const request = buildRequest({ name: 'test.data' });
+      const errorMessage = getSafeFilePathError(rootServer, filePath, request);
+
+      expect(errorMessage).to.contain(nonRootBaseError);
+    });
+
+    it('should reject fully templated relative paths when the environment directory is the filesystem root', () => {
+      const filePath = "{{queryParam 'name'}}";
+      const request = buildRequest({ name: packageJsonFromRoot });
+      const errorMessage = getSafeFilePathError(rootServer, filePath, request);
+
+      expect(errorMessage).to.contain(nonRootBaseError);
+    });
+
+    it('should reject absolute templated paths when the static base is the filesystem root', () => {
+      const filePath = `${fileSystemRoot}{{queryParam 'name'}}`;
+      const request = buildRequest({ name: packageJsonFromRoot });
+      const errorMessage = getSafeFilePathError(server, filePath, request);
+
+      expect(errorMessage).to.contain(nonRootBaseError);
+    });
+
+    it('should allow templated relative paths that stay within their static base', () => {
+      const filePath = "./static/{{queryParam 'name'}}";
+      const request = buildRequest({ name: 'asset.txt' });
+      const result = callGetSafeFilePath(rootServer, filePath, request);
+
+      expect(result).to.equal(pathResolve(fileSystemRoot, 'static/asset.txt'));
+    });
+
+    it('should allow templated relative paths that stay within a static base located outside of the environment directory', () => {
+      const environmentsServer = new MockoonServer(environment, {
+        environmentDirectory: pathResolve(dataDirectory, 'environments')
+      });
+      const filePath = "../{{queryParam 'filename'}}";
+      const request = buildRequest({ filename: 'plain.data' });
+      const result = callGetSafeFilePath(environmentsServer, filePath, request);
+
+      expect(result).to.equal(pathResolve(dataDirectory, 'plain.data'));
     });
   });
 
@@ -276,6 +366,25 @@ describe('Server file path traversal protection', () => {
       fileEnvironment.rootChildren.push({
         type: 'route',
         uuid: urlParamRoute.uuid
+      });
+
+      // route serving a file from a static base being the filesystem root
+      const fileSystemRootRoute = {
+        ...fileEnvironment.routes[0],
+        uuid: 'c5d1e3f4-8a6b-4b0c-9d7e-4f3a2b1c6d7e',
+        endpoint: 'root-files',
+        responses: [
+          {
+            ...relativeResponse,
+            uuid: 'd6e2f4a5-9b7c-4c1d-8e8f-5a4b3c2d7e8f',
+            filePath: `${fileSystemRoot}{{queryParam 'filename'}}`
+          }
+        ]
+      };
+      fileEnvironment.routes.push(fileSystemRootRoute);
+      fileEnvironment.rootChildren.push({
+        type: 'route',
+        uuid: fileSystemRootRoute.uuid
       });
 
       fileServer = new MockoonServer(fileEnvironment, {
@@ -349,6 +458,77 @@ describe('Server file path traversal protection', () => {
 
       expect(response.body).to.contain(relativePathError);
       expect(response.body).not.to.contain('root:');
+    });
+
+    it('should not serve a file with a templated absolute path whose static base is the filesystem root', async () => {
+      const filename = encodeURIComponent(packageJsonFromRoot);
+      const response = await getBody(`/root-files?filename=${filename}`);
+
+      expect(response.body).to.contain('Error while serving the content:');
+      expect(response.body).to.contain(nonRootBaseError);
+      expect(response.body).not.to.contain(packageNameField);
+    });
+  });
+
+  describe('File serving with the filesystem root as environment directory', () => {
+    const serverErrors: ServerErrorCodes[] = [];
+    let rootFileServer: MockoonServer;
+
+    before(async () => {
+      const rootEnvironment = await getEnvironment();
+      const relativeResponse = rootEnvironment.routes[0].responses[0];
+      const staticResponse = rootEnvironment.routes[1].responses[0];
+      const staticBase = pathRelative(fileSystemRoot, dataDirectory);
+
+      rootEnvironment.port = rootPort;
+      relativeResponse.bodyType = BodyTypes.FILE;
+      relativeResponse.filePath = "./{{queryParam 'filename'}}";
+      relativeResponse.sendFileAsBody = true;
+      staticResponse.bodyType = BodyTypes.FILE;
+      staticResponse.filePath = `./${staticBase}/{{queryParam 'filename'}}`;
+      staticResponse.sendFileAsBody = true;
+
+      rootFileServer = new MockoonServer(rootEnvironment, {
+        environmentDirectory: fileSystemRoot
+      });
+      rootFileServer.on('error', (errorCode) => {
+        serverErrors.push(errorCode);
+      });
+
+      await new Promise<void>((resolve) => {
+        rootFileServer.on('started', () => resolve());
+        rootFileServer.start();
+      });
+    });
+
+    after(() => {
+      rootFileServer.stop();
+    });
+
+    it('should not serve a file with a templated relative path when the only allowed base directory is the filesystem root', async () => {
+      const filename = encodeURIComponent(packageJsonFromRoot);
+      const response = await getBody(`/test?filename=${filename}`, rootPort);
+
+      expect(response.body).to.contain('Error while serving the content:');
+      expect(response.body).to.contain(nonRootBaseError);
+      expect(response.body).not.to.contain(packageNameField);
+      expect(serverErrors).to.include(ServerErrorCodes.ROUTE_SERVING_ERROR);
+    });
+
+    it('should serve a file with a templated relative path staying within its static base', async () => {
+      const response = await getBody('/test2?filename=plain.data', rootPort);
+
+      expect(response.status).to.equal(200);
+      expect(response.body).to.equal('plainTest');
+    });
+
+    it('should not serve a file with a templated relative path escaping its static base', async () => {
+      const filename = encodeURIComponent('../../package.json');
+      const response = await getBody(`/test2?filename=${filename}`, rootPort);
+
+      expect(response.body).to.contain('Error while serving the content:');
+      expect(response.body).to.contain(relativePathError);
+      expect(response.body).not.to.contain(packageNameField);
     });
   });
 });
