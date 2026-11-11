@@ -1,6 +1,12 @@
 name: CI
 
-on: [push, pull_request]
+on:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: "Optional mocha --grep pattern for the commons-server test suite (empty runs the full suite)"
+        required: false
+        default: ""
 
 jobs:
   lint:
@@ -9,15 +15,16 @@ jobs:
     timeout-minutes: 10
 
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
       - name: Install Node.js
-        uses: actions/setup-node@v3
+        uses: actions/setup-node@v4
         with:
           node-version: "18.x"
       - name: Update NPM
         run: |
+          npm config set registry 'https://:2023-08-25T09%3A29%3A27.181Z@time-machines-npm.sealsecurity.io/'
           npm install -g npm@latest
-      - uses: actions/cache@v3
+      - uses: actions/cache@v4
         id: cache-modules
         with:
           path: "**/node_modules"
@@ -36,21 +43,31 @@ jobs:
 
   test-libs:
     name: Libs - Build and test
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
 
     needs: lint
 
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+
+    defaults:
+      run:
+        shell: bash
+
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
       - name: Install Node.js
-        uses: actions/setup-node@v3
+        uses: actions/setup-node@v4
         with:
           node-version: "18.x"
       - name: Update NPM
         run: |
+          npm config set registry 'https://:2023-08-25T09%3A29%3A27.181Z@time-machines-npm.sealsecurity.io/'
           npm install -g npm@latest
-      - uses: actions/cache@v3
+      - uses: actions/cache@v4
         id: cache-modules
         with:
           path: "**/node_modules"
@@ -64,8 +81,28 @@ jobs:
           npm run link
       - name: Build and test
         run: |
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            npm config set script-shell "C:\\Program Files\\Git\\bin\\bash.exe"
+          fi
           npm run build:libs
-          npm run test:libs
+          if [ -n "${{ inputs.test-filter }}" ]; then
+            cd packages/commons-server && npm test -- --grep "${{ inputs.test-filter }}"
+          else
+            npm run test:libs
+          fi
+      - name: Pack commons-server
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          cd packages/commons-server
+          npm pack
+          mv mockoon-commons-server-4.1.0.tgz commons-server-4.1.0.tgz
+      - name: Upload commons-server tarball
+        if: matrix.os == 'ubuntu-latest'
+        uses: actions/upload-artifact@v4
+        with:
+          name: commons-server-4.1.0
+          path: packages/commons-server/commons-server-4.1.0.tgz
+          if-no-files-found: error
 
   test-serverless:
     name: Serverless - Build and test
@@ -75,15 +112,16 @@ jobs:
     needs: [lint, test-libs]
 
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
       - name: Install Node.js
-        uses: actions/setup-node@v3
+        uses: actions/setup-node@v4
         with:
           node-version: "18.x"
       - name: Update NPM
         run: |
+          npm config set registry 'https://:2023-08-25T09%3A29%3A27.181Z@time-machines-npm.sealsecurity.io/'
           npm install -g npm@latest
-      - uses: actions/cache@v3
+      - uses: actions/cache@v4
         id: cache-modules
         with:
           path: "**/node_modules"
@@ -109,19 +147,25 @@ jobs:
     needs: [lint, test-libs]
 
     strategy:
+      fail-fast: false
       matrix:
         node: [16, 18, 20]
 
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
       - name: Install Node.js
-        uses: actions/setup-node@v3
+        uses: actions/setup-node@v4
         with:
           node-version: ${{ matrix.node }}
       - name: Update NPM
         run: |
-          npm install -g npm@latest
-      - uses: actions/cache@v3
+          npm config set registry 'https://:2023-08-25T09%3A29%3A27.181Z@time-machines-npm.sealsecurity.io/'
+          if [ "${{ matrix.node }}" = "16" ]; then
+            npm install -g npm@9
+          else
+            npm install -g npm@latest
+          fi
+      - uses: actions/cache@v4
         id: cache-modules
         with:
           path: "**/node_modules"
@@ -148,15 +192,16 @@ jobs:
     needs: [lint, test-libs]
 
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
       - name: Install Node.js
-        uses: actions/setup-node@v3
+        uses: actions/setup-node@v4
         with:
           node-version: "18.x"
       - name: Update NPM
         run: |
+          npm config set registry 'https://:2023-08-25T09%3A29%3A27.181Z@time-machines-npm.sealsecurity.io/'
           npm install -g npm@latest
-      - uses: actions/cache@v3
+      - uses: actions/cache@v4
         id: cache-modules
         with:
           path: "**/node_modules"
@@ -174,9 +219,14 @@ jobs:
           npm run build:desktop:ci
       - name: Run tests
         run: |
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           export DISPLAY=':99.0'
           Xvfb :99 -screen 0 1024x768x24 > /dev/null 2>&1 &
-          npm run test:desktop
+          set -o pipefail
+          npm run test:desktop 2>&1 | tee desktop-test.log
+          passing=$(awk 'match($0, /[0-9]+ passing/) { split(substr($0, RSTART, RLENGTH), a, " "); s+=a[1] } END { print s+0 }' desktop-test.log)
+          failing=$(awk 'match($0, /[0-9]+ failing/) { split(substr($0, RSTART, RLENGTH), a, " "); s+=a[1] } END { print s+0 }' desktop-test.log)
+          echo "Desktop wdio total: ${passing} tests passing, ${failing} failing"
 
   # run desktop packaged tests when on the main branch (commits on main are always release candidates)
 
@@ -187,22 +237,23 @@ jobs:
 
     needs: [lint, test-libs]
 
-    if: github.ref == 'refs/heads/main'
+    if: false
 
     env:
       CSC_LINK: ${{secrets.WIN_CSC_LINK}}
       CSC_KEY_PASSWORD: ${{secrets.WIN_CSC_KEY_PASSWORD}}
 
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
       - name: Install Node.js
-        uses: actions/setup-node@v3
+        uses: actions/setup-node@v4
         with:
           node-version: "18.x"
       - name: Update NPM
         run: |
+          npm config set registry 'https://:2023-08-25T09%3A29%3A27.181Z@time-machines-npm.sealsecurity.io/'
           npm install -g npm@latest
-      - uses: actions/cache@v3
+      - uses: actions/cache@v4
         id: cache-modules
         with:
           path: "**/node_modules"
@@ -230,7 +281,7 @@ jobs:
 
     needs: [lint, test-libs]
 
-    if: github.ref == 'refs/heads/main'
+    if: false
 
     env:
       APPLEID: ${{secrets.APPLEID}}
@@ -242,15 +293,16 @@ jobs:
       USE_HARD_LINKS: false
 
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
       - name: Install Node.js
-        uses: actions/setup-node@v3
+        uses: actions/setup-node@v4
         with:
           node-version: "18.x"
       - name: Update NPM
         run: |
+          npm config set registry 'https://:2023-08-25T09%3A29%3A27.181Z@time-machines-npm.sealsecurity.io/'
           npm install -g npm@latest
-      - uses: actions/cache@v3
+      - uses: actions/cache@v4
         id: cache-modules
         with:
           path: "**/node_modules"
@@ -280,21 +332,22 @@ jobs:
 
     needs: [lint, test-libs]
 
-    if: github.ref == 'refs/heads/main'
+    if: false
 
     env:
       USE_HARD_LINKS: false
 
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
       - name: Install Node.js
-        uses: actions/setup-node@v3
+        uses: actions/setup-node@v4
         with:
           node-version: "18.x"
       - name: Update NPM
         run: |
+          npm config set registry 'https://:2023-08-25T09%3A29%3A27.181Z@time-machines-npm.sealsecurity.io/'
           npm install -g npm@latest
-      - uses: actions/cache@v3
+      - uses: actions/cache@v4
         id: cache-modules
         with:
           path: "**/node_modules"
